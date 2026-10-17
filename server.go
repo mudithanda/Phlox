@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"errors"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -13,7 +16,7 @@ type Server struct {
 	wg sync.WaitGroup
 }
 
-func NewServer(addr string) * Server {
+func NewServer(addr string) *Server {
 	return &Server{
 		addr: addr,
 	}
@@ -54,23 +57,41 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// handleConn echoes every byte it receives back to the client.
-// replace the echo with a RESP parser.
+// handleConn serves one client: read a command, run it, send the reply
+// repeat until the client leaves or sends something invalid.
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
-	log.Printf("client connected: %s", conn.RemoteAddr())
+	remote := conn.RemoteAddr()
+	log.Printf("client connected: %s", remote)
+	defer log.Printf("client disconnected: %s", remote)
 
-	buf := make([]byte, 1024)
+	// The bufio.Reader sits between the socket and the parser. It keeps
+	// bytes that arrived early (the start of the next command) so they are not lost between ReadCommand calls.
+	
+	r := bufio.NewReader(conn)
+	w := NewWriter(conn)
+
 	for {
-		n, err := conn.Read(buf)
+		args, err := ReadCommand(r)
 		if err != nil {
-			// io.EOF means the client closed the connection normally.
-			log.Printf("client disconnected: %s", conn.RemoteAddr())
+			var pe *ProtocolError
+			switch {
+			case errors.As(err, &pe):
+				// The stream is out of sync and cannot be recovered
+				// tell the client why, then hang up.
+				w.Error("ERR Protocol error: " + pe.Msg)
+				w.Flush()
+			case !errors.Is(err, io.EOF):
+				log.Printf("client %s: %v", remote, err)
+			}
 			return
 		}
-		log.Printf("received %d bytes: %q", n, buf[:n])
-		if _, err := conn.Write(buf[:n]); err != nil {
+		if len(args) == 0 {
+			continue
+		}
+		execute(w, args)
+		if err := w.Flush(); err != nil {
 			return
 		}
 	}
